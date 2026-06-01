@@ -99,6 +99,16 @@ def _kimi_default_headers(provider: LLMProvider, oauth: OAuthManager | None) -> 
     headers = {"User-Agent": USER_AGENT}
     if oauth:
         headers.update(oauth.common_headers())
+    # Per-trial sticky-routing hint for the amdpilot kimi-pick-provider
+    # proxy: when AMDPILOT_TASK_ID is set (which docker_manager.py does
+    # for every harness container), tagging every chat completion with
+    # the trial id lets the proxy pin (task_id → backend) for the entire
+    # trial — preserving sgl KV/hicache across all turns instead of
+    # being shuffled by saturation-aware re-picks. Harmless against
+    # backends that don't recognise the header.
+    task_id = os.environ.get("AMDPILOT_TASK_ID", "").strip()
+    if task_id:
+        headers["X-Amdpilot-Task-Id"] = task_id
     if provider.custom_headers:
         headers.update(provider.custom_headers)
     return headers
