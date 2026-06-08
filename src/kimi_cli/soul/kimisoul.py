@@ -313,6 +313,7 @@ class KimiSoul:
           - Consumers can use line offset or ``seq`` as a cursor.
         """
         import json
+        import time as _time
         from pathlib import Path as _Path
 
         if self._status_interval <= 0:
@@ -321,30 +322,57 @@ class KimiSoul:
             return
 
         status_path = _Path(str(self._runtime.session.work_dir)) / ".agent_status.jsonl"
+        # Full-fidelity sibling of .agent_status.jsonl. The status file is the
+        # bounded liveness/nudge channel (content_preview[:500], tool_args
+        # truncated to ~200 chars); the orchestrator's narrator + judge need the
+        # UNTRUNCATED reasoning and tool output so they summarize the real
+        # trajectory instead of a 500-char preview ("summary of a summary").
+        # This trace is additive — .agent_status.jsonl is unchanged, so every
+        # existing consumer (dashboard liveness, nudge agent, Phase-2A triggers)
+        # keeps working untouched. Records carry the FULL content + FULL tool
+        # arguments keyed by the same monotonic ``seq`` so a consumer can join
+        # the two streams or read this one alone.
+        trace_path = _Path(str(self._runtime.session.work_dir)) / ".agent_trace.jsonl"
 
         # Drain the buffer
         events = list(self._status_event_buffer)
         self._status_event_buffer.clear()
 
         lines: list[str] = []
+        trace_lines: list[str] = []
         for event_step, msg in events:
             self._status_seq += 1
+            seq = self._status_seq
             text = msg.extract_text(" ") if hasattr(msg, "extract_text") else str(msg.content)
             preview = text[:500] if text else ""
             entry: dict[str, object] = {
-                "seq": self._status_seq,
+                "seq": seq,
                 "step": event_step,
                 "role": msg.role,
                 "content_preview": preview,
             }
             if text and len(text) > 500:
                 entry["content_tail"] = text[-300:]
+
+            # Full-fidelity record for .agent_trace.jsonl: full content + full
+            # tool calls (name + raw JSON arguments, untruncated).
+            trace_entry: dict[str, object] = {
+                "seq": seq,
+                "step": event_step,
+                "role": msg.role,
+                "ts": _time.time(),
+                "content": text or "",
+            }
+
             if hasattr(msg, "tool_calls") and msg.tool_calls:
                 entry["tool_calls"] = [tc.function.name for tc in msg.tool_calls]
+                full_tool_calls: list[dict[str, object]] = []
                 tool_args: list[str] = []
                 for tc in msg.tool_calls:
                     name = tc.function.name
                     args_raw = tc.function.arguments
+                    # Full, untruncated tool call for the trace.
+                    full_tool_calls.append({"name": name, "arguments": args_raw or ""})
                     if not args_raw:
                         continue
                     try:
@@ -375,7 +403,11 @@ class KimiSoul:
                             tool_args.append(f"{name}({fp})")
                 if tool_args:
                     entry["tool_args_summary"] = tool_args
+                if full_tool_calls:
+                    trace_entry["tool_calls"] = full_tool_calls
+
             lines.append(json.dumps(entry, ensure_ascii=False))
+            trace_lines.append(json.dumps(trace_entry, ensure_ascii=False))
 
         try:
             with open(status_path, "a", encoding="utf-8") as f:
@@ -386,6 +418,16 @@ class KimiSoul:
         except OSError:
             # Write failed — put events back so they're not lost
             self._status_event_buffer.extend(events)
+            return
+
+        # Best-effort full-fidelity trace. A failure here must NOT lose events
+        # (they were already committed to .agent_status.jsonl above) nor raise —
+        # the trace is an enrichment channel, not the liveness contract.
+        try:
+            with open(trace_path, "a", encoding="utf-8") as f:
+                f.write("\n".join(trace_lines) + "\n")
+        except OSError:
+            logger.debug("Failed to append agent trace at step {step}", step=step_no)
 
     async def _inject_steer(self, content: str | list[ContentPart]) -> None:
         """Inject a single steer as a synthetic ``_steer`` tool_call + tool result pair."""
@@ -559,6 +601,10 @@ class KimiSoul:
             status_path = _Path(str(self._runtime.session.work_dir)) / ".agent_status.jsonl"
             with suppress(OSError):
                 status_path.write_text("", encoding="utf-8")
+            # Reset the full-fidelity trace sibling for this trial too.
+            trace_path = _Path(str(self._runtime.session.work_dir)) / ".agent_trace.jsonl"
+            with suppress(OSError):
+                trace_path.write_text("", encoding="utf-8")
 
         if isinstance(self._agent.toolset, KimiToolset):
             await self._agent.toolset.wait_for_mcp_tools()
