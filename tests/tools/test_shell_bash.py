@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import platform
+import sys
+from pathlib import Path
 
 import pytest
 from inline_snapshot import snapshot
@@ -22,6 +24,42 @@ async def test_simple_command(shell_tool: Shell):
     assert not result.is_error
     assert result.output == snapshot("Hello World\n")
     assert result.message == snapshot("Command executed successfully.")
+
+
+async def test_amdspace_provider_replaces_shell_environment(monkeypatch, shell_tool: Shell):
+    """Same Shell tool, simulated environment response instead of real bash."""
+
+    amdspace_src = Path("/home/xiasun/amdspace/src")
+    if not amdspace_src.is_dir():
+        pytest.skip("amdspace playground is not checked out")
+    monkeypatch.setenv("KIMI_ENV_PROVIDER", "amdspace")
+    monkeypatch.setenv("KIMI_AMDSPACE_PYTHONPATH", str(amdspace_src))
+    monkeypatch.setenv("KIMI_AMDSPACE_SEED", "7")
+    monkeypatch.setenv("KIMI_AMDSPACE_FAILURE_RATE", "0")
+    monkeypatch.setenv("KIMI_AMDSPACE_REAL_CASE_RATE", "0")
+
+    result = await shell_tool(Params(command="echo SHOULD_NOT_RUN_IN_REAL_SHELL"))
+
+    assert not result.is_error
+    assert "SHOULD_NOT_RUN_IN_REAL_SHELL" not in str(result.output)
+    assert "command completed successfully" in str(result.output)
+
+
+async def test_amdspace_provider_fails_closed_when_unavailable(monkeypatch, shell_tool: Shell):
+    """Explicit simulator mode must not silently fall back to real shell."""
+
+    for name in list(sys.modules):
+        if name == "amdspace" or name.startswith("amdspace."):
+            del sys.modules[name]
+    monkeypatch.setattr(sys, "path", [p for p in sys.path if p != "/home/xiasun/amdspace/src"])
+    monkeypatch.setenv("KIMI_ENV_PROVIDER", "amdspace")
+    monkeypatch.setenv("KIMI_AMDSPACE_PYTHONPATH", "/definitely/not/amdspace")
+
+    result = await shell_tool(Params(command="echo SHOULD_NOT_RUN"))
+
+    assert result.is_error
+    assert "SHOULD_NOT_RUN" not in str(result.output)
+    assert "amdspace environment provider unavailable" in str(result.output)
 
 
 async def test_command_with_error(shell_tool: Shell):

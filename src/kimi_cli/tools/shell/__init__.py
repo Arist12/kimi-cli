@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import os
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import override
@@ -16,6 +18,69 @@ from kimi_cli.utils.environment import Environment
 from kimi_cli.utils.subprocess_env import get_clean_env
 
 MAX_TIMEOUT = int(os.environ.get("KIMI_MAX_TIMEOUT", 90 * 60))
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _shell_env_provider() -> str:
+    provider = os.environ.get("KIMI_ENV_PROVIDER", "").strip().lower()
+    if provider:
+        return provider
+    # AMDPilot passes this knob during dry-run-amdspace experiments. Treat it as
+    # an explicit provider request so a missing amdspace install fails closed
+    # instead of silently running the real Docker shell.
+    if _truthy_env("AMDPILOT_AMDSPACE"):
+        return "amdspace"
+    return "docker"
+
+
+def _float_env(*names: str, default: float) -> float:
+    for name in names:
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            try:
+                return float(raw)
+            except ValueError:
+                return default
+    return default
+
+
+def _int_env(*names: str, default: int | None = None) -> int | None:
+    for name in names:
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            try:
+                return int(raw)
+            except ValueError:
+                return default
+    return default
+
+
+def _add_amdspace_pythonpath() -> None:
+    raw = (
+        os.environ.get("KIMI_AMDSPACE_PYTHONPATH", "").strip()
+        or os.environ.get("AMDPILOT_AMDSPACE_PYTHONPATH", "").strip()
+    )
+    for entry in reversed([p for p in raw.split(os.pathsep) if p]):
+        if entry not in sys.path:
+            sys.path.insert(0, entry)
+
+
+def _amdspace_seed(command: str) -> int:
+    explicit = _int_env("KIMI_AMDSPACE_SEED", "AMDPILOT_AMDSPACE_SEED", default=None)
+    if explicit is not None:
+        return explicit
+    task_id = os.environ.get("AMDPILOT_TASK_ID", "") or os.environ.get("AMDPILOT_EXPERIMENT_ID", "")
+    digest = hashlib.sha256(f"{task_id}\0{command}".encode("utf-8")).hexdigest()
+    return int(digest[:12], 16)
 
 
 class Params(BaseModel):
@@ -100,6 +165,13 @@ class Shell(CallableTool2[Params]):
         stderr_cb: Callable[[bytes], None],
         timeout: int,
     ) -> int:
+        provider = _shell_env_provider()
+        if provider == "amdspace":
+            return await self._run_amdspace_command(command, stdout_cb, stderr_cb, timeout)
+        if provider not in ("", "docker", "real"):
+            stderr_cb(f"KIMI_ENV_PROVIDER={provider!r} is not supported\n".encode())
+            return 127
+
         async def _read_stream(stream: AsyncReadable, cb: Callable[[bytes], None]):
             while True:
                 line = await stream.readline()
@@ -122,6 +194,61 @@ class Shell(CallableTool2[Params]):
         except TimeoutError:
             await process.kill()
             raise
+
+    async def _run_amdspace_command(
+        self,
+        command: str,
+        stdout_cb: Callable[[bytes], None],
+        stderr_cb: Callable[[bytes], None],
+        timeout: int,
+    ) -> int:
+        try:
+            _add_amdspace_pythonpath()
+            from amdspace import TeacherConfig, TeacherEnv, ToolCall  # type: ignore
+        except Exception as exc:  # noqa: BLE001 - explicit simulator mode fails closed
+            stderr_cb(f"amdspace environment provider unavailable: {exc}\n".encode())
+            return 127
+
+        db_path = (
+            os.environ.get("KIMI_AMDSPACE_DB", "").strip()
+            or os.environ.get("AMDPILOT_AMDSPACE_DB", "").strip()
+            or None
+        )
+        try:
+            response = TeacherEnv(
+                TeacherConfig(
+                    seed=_amdspace_seed(command),
+                    db_path=db_path,
+                    real_case_rate=_float_env(
+                        "KIMI_AMDSPACE_REAL_CASE_RATE",
+                        "AMDPILOT_AMDSPACE_REAL_CASE_RATE",
+                        default=0.35,
+                    ),
+                    failure_rate=_float_env(
+                        "KIMI_AMDSPACE_FAILURE_RATE",
+                        "AMDPILOT_AMDSPACE_FAILURE_RATE",
+                        default=0.18,
+                    ),
+                    noise_rate=_float_env(
+                        "KIMI_AMDSPACE_NOISE_RATE",
+                        "AMDPILOT_AMDSPACE_NOISE_RATE",
+                        default=0.12,
+                    ),
+                )
+            ).respond(ToolCall("Shell", {"command": command, "timeout": timeout}))
+        except Exception as exc:  # noqa: BLE001
+            stderr_cb(f"amdspace environment provider failed: {exc}\n".encode())
+            return 127
+
+        # Preserve the Shell tool contract: stdout/stderr are merged into the
+        # tool output, and the returned exit code drives ToolResultBuilder.ok/error.
+        if (
+            getattr(response, "latency_s", 0) > 0
+            and (_truthy_env("KIMI_AMDSPACE_APPLY_LATENCY") or _truthy_env("AMDPILOT_AMDSPACE_APPLY_LATENCY"))
+        ):
+            await asyncio.sleep(min(float(response.latency_s), max(0, timeout)))
+        stdout_cb((response.as_tool_output().rstrip() + "\n").encode("utf-8", errors="replace"))
+        return int(getattr(response, "exit_code", 0) or 0)
 
     def _shell_args(self, command: str) -> tuple[str, ...]:
         if self._is_powershell:
