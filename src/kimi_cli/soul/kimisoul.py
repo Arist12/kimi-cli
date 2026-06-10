@@ -18,7 +18,7 @@ from kosong.chat_provider import (
     APITimeoutError,
     RetryableChatProvider,
 )
-from kosong.message import Message, ToolCall
+from kosong.message import Message, ThinkPart, ToolCall
 from tenacity import RetryCallState, retry_if_exception, stop_after_attempt, wait_exponential_jitter
 
 from kimi_cli.llm import ModelCapability
@@ -345,6 +345,20 @@ class KimiSoul:
             seq = self._status_seq
             text = msg.extract_text(" ") if hasattr(msg, "extract_text") else str(msg.content)
             preview = text[:500] if text else ""
+            # The reasoning models (kimi_k2) emit their chain-of-thought as a
+            # separate ``ThinkPart`` that ``extract_text()`` (TextPart-only)
+            # silently drops, so the agent's "why" never reached the trace —
+            # starving the narrator/judge of reasoning while we still paid for
+            # the reasoning tokens. Capture it verbatim here so it is archived in
+            # ``.agent_trace.jsonl`` and can flow to ``visible_reason``. (xsun)
+            reasoning_text = ""
+            msg_content = getattr(msg, "content", None)
+            if isinstance(msg_content, list):
+                reasoning_text = "\n".join(
+                    part.think.strip()
+                    for part in msg_content
+                    if isinstance(part, ThinkPart) and getattr(part, "think", "").strip()
+                ).strip()
             entry: dict[str, object] = {
                 "seq": seq,
                 "step": event_step,
@@ -353,9 +367,12 @@ class KimiSoul:
             }
             if text and len(text) > 500:
                 entry["content_tail"] = text[-300:]
+            if reasoning_text:
+                entry["reasoning_preview"] = reasoning_text[:500]
 
             # Full-fidelity record for .agent_trace.jsonl: full content + full
-            # tool calls (name + raw JSON arguments, untruncated).
+            # tool calls (name + raw JSON arguments, untruncated) + the model's
+            # full reasoning (ThinkPart) so the raw "why" is archived on disk.
             trace_entry: dict[str, object] = {
                 "seq": seq,
                 "step": event_step,
@@ -363,6 +380,8 @@ class KimiSoul:
                 "ts": _time.time(),
                 "content": text or "",
             }
+            if reasoning_text:
+                trace_entry["reasoning"] = reasoning_text
 
             if hasattr(msg, "tool_calls") and msg.tool_calls:
                 entry["tool_calls"] = [tc.function.name for tc in msg.tool_calls]
